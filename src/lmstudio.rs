@@ -199,6 +199,64 @@ impl LmStudioClient {
         Ok(model_ids)
     }
 
+    /// Generates a concise rolling summary of conversation history
+    pub async fn generate_summary(
+        &self,
+        model: &str,
+        new_dialogue: &str,
+        previous_summary: Option<&str>,
+    ) -> Result<String, String> {
+        let endpoint = format!("{}/api/v1/chat", self.base_url);
+
+        let system_instruction = "You are a concise conversation summarizer. Your task is to extract and condense key context, facts, decisions, and preferences into a brief summary. Omit small talk and pleasantries.";
+
+        let user_prompt = match previous_summary {
+            Some(prev) if !prev.trim().is_empty() => {
+                format!(
+                    "Update the following existing summary by incorporating the new conversation turns.\n\n\
+                    [Existing Summary]:\n{}\n\n\
+                    [New Conversation Turns]:\n{}\n\n\
+                    Provide an updated, concise bulleted summary:",
+                    prev.trim(),
+                    new_dialogue.trim()
+                )
+            }
+            _ => {
+                format!(
+                    "Summarize the key facts, user preferences, decisions, and ongoing context from these conversation turns into concise bullet points:\n\n\
+                    {}\n\n\
+                    Concise Summary:",
+                    new_dialogue.trim()
+                )
+            }
+        };
+
+        let request_body = NativeChatRequest {
+            model: model.to_string(),
+            input: user_prompt,
+            system_prompt: Some(system_instruction.to_string()),
+            previous_response_id: None,
+            temperature: Some(0.3),
+            integrations: Vec::new(),
+        };
+
+        let chat_resp = self.execute_chat_request(&endpoint, &request_body).await?;
+
+        let summary = chat_resp
+            .output
+            .into_iter()
+            .filter(|item| item.item_type == "message")
+            .filter_map(|item| item.content)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        if summary.trim().is_empty() {
+            Err("Empty summary returned from model".to_string())
+        } else {
+            Ok(summary.trim().to_string())
+        }
+    }
+
     /// Sends a chat request to LM Studio's native /api/v1/chat endpoint with MCP support
     pub async fn chat(
         &self,

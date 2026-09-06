@@ -25,6 +25,8 @@ pub enum Command {
     Temperature(String),
     #[command(description = "List active MCP server integrations.")]
     Mcp,
+    #[command(description = "View the current compacted rolling summary.")]
+    Summary,
     #[command(description = "Clear current conversation memory.")]
     Clear,
     #[command(description = "Clear current conversation memory (alias for /clear).")]
@@ -92,6 +94,7 @@ pub async fn handle_command(
                 • Use /models to see models currently loaded or available in LM Studio.\n\
                 • Use /model <name> to switch models for this chat.\n\
                 • Use /mcp to see active MCP tools and servers.\n\
+                • Use /summary to see your rolling conversation compaction summary.\n\
                 • Use /clear or /reset to wipe the conversation history and start fresh.\n\
                 • Use /status to view current session settings.\n\
                 • Use /help to see all available commands.",
@@ -107,8 +110,10 @@ pub async fn handle_command(
                 {}\n\n\
                 *Tips:*\n\
                 - To reset your system prompt to default, run `/system default`\n\
-                - To reset model selection to default, run `/model auto`",
-                Command::descriptions()
+                - To reset model selection to default, run `/model auto`\n\
+                - Automatic compaction condenses your conversation every {} turns into a durable summary.",
+                Command::descriptions(),
+                config.max_history_turns
             );
             send_safe_message(&bot, chat_id, &help_text).await?;
         }
@@ -237,6 +242,22 @@ pub async fn handle_command(
             send_safe_message(&bot, chat_id, &text).await?;
         }
 
+        Command::Summary => {
+            let store = sessions.read().await;
+            let session = store.get(&chat_id);
+            let text = match session.and_then(|s| s.rolling_summary.as_ref()) {
+                Some(summary) if !summary.trim().is_empty() => {
+                    format!("🧠 *Current Rolling Conversation Summary:*\n\n{}", summary)
+                }
+                _ => format!(
+                    "ℹ️ No conversation summary has been generated yet for this chat.\n\n\
+                    Summaries are automatically created once conversation reaches {} turns to preserve context indefinitely.",
+                    config.max_history_turns
+                ),
+            };
+            send_safe_message(&bot, chat_id, &text).await?;
+        }
+
         Command::Clear | Command::Reset => {
             let mut store = sessions.write().await;
             let session = store.entry(chat_id).or_default();
@@ -244,7 +265,7 @@ pub async fn handle_command(
             session.clear_history();
 
             let text = format!(
-                "🧹 *Conversation cleared!*\nRemoved {} previous message(s) from memory. Starting fresh.",
+                "🧹 *Conversation cleared!*\nRemoved {} previous message(s) and cleared compaction memory. Starting fresh.",
                 count
             );
             send_safe_message(&bot, chat_id, &text).await?;
@@ -276,6 +297,11 @@ pub async fn handle_command(
                 client.mcp_servers().join(", ")
             };
 
+            let summary_status = match session.and_then(|s| s.rolling_summary.as_ref()) {
+                Some(s) => format!("Active ({} chars)", s.len()),
+                None => "None".to_string(),
+            };
+
             let status_msg = format!(
                 "📊 *Current Chat Status:*\n\n\
                 • *LM Studio URL:* `{}`\n\
@@ -283,7 +309,8 @@ pub async fn handle_command(
                 • *Active Model:* `{}`\n\
                 • *Temperature:* `{:.2}`\n\
                 • *MCP Servers:* `{}`\n\
-                • *History Length:* `{}` message(s)\n\
+                • *History Length:* `{}` message(s) (Compacts at {})\n\
+                • *Rolling Summary:* `{}`\n\
                 • *System Prompt:* {}\n",
                 client.base_url(),
                 lm_status,
@@ -291,6 +318,8 @@ pub async fn handle_command(
                 temp,
                 mcp_info,
                 history_len,
+                config.max_history_turns * 2,
+                summary_status,
                 if session.and_then(|s| s.custom_system_prompt.as_ref()).is_some() {
                     "Custom"
                 } else {
@@ -328,29 +357,16 @@ pub async fn handle_message(
 
     let chat_id = msg.chat.id;
 
-    // Resolve model, temperature, and previous_response_id
-    let (model, temp, system_prompt, prev_response_id) = {
+    // Resolve target model
+    let target_model = {
         let store = sessions.read().await;
         let session = store.get(&chat_id);
-
-        let selected_model = session
+        session
             .and_then(|s| s.active_model.clone())
-            .or_else(|| config.default_model.clone());
-
-        let temp = session
-            .map(|s| s.get_effective_temperature(config.default_temperature))
-            .unwrap_or(config.default_temperature);
-
-        let sys = session
-            .and_then(|s| s.custom_system_prompt.clone())
-            .unwrap_or_else(|| config.default_system_prompt.clone());
-
-        let prev_id = session.and_then(|s| s.last_response_id.clone());
-
-        (selected_model, temp, sys, prev_id)
+            .or_else(|| config.default_model.clone())
     };
 
-    let target_model = match model {
+    let target_model = match target_model {
         Some(m) => m,
         None => {
             // Auto-detect first model from LM Studio
@@ -369,6 +385,75 @@ pub async fn handle_message(
                 }
             }
         }
+    };
+
+    // Check if session needs compaction (history reached turn threshold)
+    let needs_compaction = {
+        let store = sessions.read().await;
+        store
+            .get(&chat_id)
+            .map(|s| s.needs_compaction(config.max_history_turns))
+            .unwrap_or(false)
+    };
+
+    if needs_compaction {
+        let (history_text, prev_summary) = {
+            let store = sessions.read().await;
+            let session = store.get(&chat_id).unwrap();
+            (
+                session.format_history_for_summary(),
+                session.rolling_summary.clone(),
+            )
+        };
+
+        info!(
+            chat_id = %chat_id,
+            "Compacting conversation history into rolling summary..."
+        );
+        let typing_compaction = spawn_typing_indicator(bot.clone(), chat_id);
+        let summary_result = client
+            .generate_summary(&target_model, &history_text, prev_summary.as_deref())
+            .await;
+        typing_compaction.abort();
+
+        match summary_result {
+            Ok(new_summary) => {
+                info!(
+                    chat_id = %chat_id,
+                    "Conversation compaction succeeded. Rolling summary updated."
+                );
+                let mut store = sessions.write().await;
+                if let Some(session) = store.get_mut(&chat_id) {
+                    session.apply_compaction(new_summary);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    chat_id = %chat_id,
+                    "Compaction summary failed: {}. Continuing without compaction.",
+                    e
+                );
+            }
+        }
+    }
+
+    // Resolve system prompt, temperature, and previous_response_id
+    let (temp, system_prompt, prev_response_id) = {
+        let store = sessions.read().await;
+        let session = store.get(&chat_id);
+
+        let temp = session
+            .map(|s| s.get_effective_temperature(config.default_temperature))
+            .unwrap_or(config.default_temperature);
+
+        let sys = match session {
+            Some(s) => s.get_system_prompt_with_summary(&config.default_system_prompt),
+            None => config.default_system_prompt.clone(),
+        };
+
+        let prev_id = session.and_then(|s| s.last_response_id.clone());
+
+        (temp, sys, prev_id)
     };
 
     info!(
@@ -400,12 +485,7 @@ pub async fn handle_message(
             {
                 let mut store = sessions.write().await;
                 let session = store.entry(chat_id).or_default();
-                session.record_exchange(
-                    text,
-                    &reply_content,
-                    new_response_id,
-                    config.max_history_turns,
-                );
+                session.record_exchange(text, &reply_content, new_response_id);
             }
 
             if let Some(u) = usage {
