@@ -226,43 +226,43 @@ impl LmStudioClient {
             );
         }
 
+        // When previous_response_id is present, the conversation already contains
+        // the initial system prompt. Passing system_prompt again causes LM Studio
+        // to insert a system message mid-conversation, which triggers Jinja error:
+        // "System message must be at the beginning."
+        let effective_system_prompt = if previous_response_id.is_none() {
+            system_prompt.map(|s| s.to_string())
+        } else {
+            None
+        };
+
         let request_body = NativeChatRequest {
             model: model.to_string(),
             input: input.to_string(),
-            system_prompt: system_prompt.map(|s| s.to_string()),
+            system_prompt: effective_system_prompt,
             previous_response_id: previous_response_id.map(|s| s.to_string()),
             temperature: Some(temperature),
             integrations,
         };
 
-        let resp = self
-            .client
-            .post(&endpoint)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_connect() {
-                    format!(
-                        "Could not connect to LM Studio at {}.\nPlease verify LM Studio server is running.",
-                        self.base_url
-                    )
-                } else if e.is_timeout() {
-                    "Request to LM Studio timed out. The local model took too long to generate a response.".to_string()
-                } else {
-                    format!("LM Studio connection error: {}", e)
-                }
-            })?;
+        let mut chat_result = self.execute_chat_request(&endpoint, &request_body).await;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("LM Studio returned HTTP {status}: {body}"));
+        // Self-healing fallback: if continuation with previous_response_id failed
+        // (e.g. expired ID, server restart, template mismatch), retry as a fresh turn
+        if chat_result.is_err() && previous_response_id.is_some() {
+            tracing::warn!("Request with previous_response_id failed. Retrying with fresh conversation context...");
+            let fallback_body = NativeChatRequest {
+                model: model.to_string(),
+                input: input.to_string(),
+                system_prompt: system_prompt.map(|s| s.to_string()),
+                previous_response_id: None,
+                temperature: Some(temperature),
+                integrations: request_body.integrations.clone(),
+            };
+            chat_result = self.execute_chat_request(&endpoint, &fallback_body).await;
         }
 
-        let chat_resp: NativeChatResponse = resp.json().await.map_err(|e| {
-            format!("Failed to parse response from LM Studio: {}", e)
-        })?;
+        let chat_resp = chat_result?;
 
         // Extract message texts from output array
         let mut messages = Vec::new();
@@ -302,5 +302,42 @@ impl LmStudioClient {
         });
 
         Ok((full_text, chat_resp.response_id, usage))
+    }
+
+    async fn execute_chat_request(
+        &self,
+        endpoint: &str,
+        request_body: &NativeChatRequest,
+    ) -> Result<NativeChatResponse, String> {
+        let resp = self
+            .client
+            .post(endpoint)
+            .json(request_body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_connect() {
+                    format!(
+                        "Could not connect to LM Studio at {}.\nPlease verify LM Studio server is running.",
+                        self.base_url
+                    )
+                } else if e.is_timeout() {
+                    "Request to LM Studio timed out. The local model took too long to generate a response.".to_string()
+                } else {
+                    format!("LM Studio connection error: {}", e)
+                }
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("LM Studio returned HTTP {status}: {body}"));
+        }
+
+        let chat_resp: NativeChatResponse = resp.json().await.map_err(|e| {
+            format!("Failed to parse response from LM Studio: {}", e)
+        })?;
+
+        Ok(chat_resp)
     }
 }
