@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::formatting::{send_safe_message, spawn_typing_indicator, split_message};
@@ -33,8 +33,28 @@ pub enum Command {
 
 fn check_auth(user: Option<&teloxide::types::User>, config: &Config) -> bool {
     match user {
-        Some(u) => config.is_user_allowed(u.id.0 as i64),
-        None => true,
+        Some(u) => {
+            let allowed = config.is_user_allowed(u.id.0 as i64);
+            if !allowed {
+                warn!(
+                    user_id = u.id.0,
+                    username = ?u.username,
+                    "Unauthorized access attempt rejected"
+                );
+            }
+            allowed
+        }
+        None => config.authorised_users.is_none(),
+    }
+}
+
+fn unauthorized_reply(user: Option<&teloxide::types::User>) -> String {
+    match user {
+        Some(u) => format!(
+            "⛔ You are not authorised to use this bot.\nYour Telegram User ID is: `{}`",
+            u.id.0
+        ),
+        None => "⛔ You are not authorised to use this bot.".to_string(),
     }
 }
 
@@ -47,8 +67,7 @@ pub async fn handle_command(
     sessions: SessionStore,
 ) -> ResponseResult<()> {
     if !check_auth(msg.from.as_ref(), &config) {
-        bot.send_message(msg.chat.id, "⛔ You are not authorized to use this bot.")
-            .await?;
+        send_safe_message(&bot, msg.chat.id, &unauthorized_reply(msg.from.as_ref())).await?;
         return Ok(());
     }
 
@@ -260,8 +279,7 @@ pub async fn handle_message(
     sessions: SessionStore,
 ) -> ResponseResult<()> {
     if !check_auth(msg.from.as_ref(), &config) {
-        bot.send_message(msg.chat.id, "⛔ You are not authorized to use this bot.")
-            .await?;
+        send_safe_message(&bot, msg.chat.id, &unauthorized_reply(msg.from.as_ref())).await?;
         return Ok(());
     }
 

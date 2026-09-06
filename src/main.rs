@@ -39,6 +39,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    match &config.authorised_users {
+        Some(users) => info!("Access control enabled: {} authorised user(s) configured", users.len()),
+        None => warn!("Access control disabled: bot is open to all Telegram users (AUTHORISED_USERS not set)"),
+    }
+
     let client = LmStudioClient::new(config.lm_studio_url.clone());
     let sessions = create_session_store();
 
