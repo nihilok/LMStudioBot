@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::env;
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bot_token: String,
     pub lm_studio_url: String,
+    pub api_token: Option<String>,
+    pub mcp_servers: Vec<String>,
     pub default_model: Option<String>,
     pub default_system_prompt: String,
     pub max_history_turns: usize,
@@ -62,6 +65,29 @@ pub fn parse_user_ids(input: &str) -> Option<HashSet<i64>> {
     }
 }
 
+/// Automatically detects MCP servers configured in ~/.lmstudio/mcp.json
+fn auto_detect_mcp_servers() -> Vec<String> {
+    let mut servers = Vec::new();
+    if let Ok(home) = env::var("HOME") {
+        let mcp_path = Path::new(&home).join(".lmstudio/mcp.json");
+        if let Ok(content) = std::fs::read_to_string(mcp_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(map) = val.get("mcpServers").and_then(|s| s.as_object()) {
+                    for key in map.keys() {
+                        let id = if key.starts_with("mcp/") {
+                            key.clone()
+                        } else {
+                            format!("mcp/{}", key)
+                        };
+                        servers.push(id);
+                    }
+                }
+            }
+        }
+    }
+    servers
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let bot_token = env::var("TELOXIDE_TOKEN")
@@ -69,11 +95,44 @@ impl Config {
             .map_err(|_| "Missing TELOXIDE_TOKEN or TELEGRAM_BOT_TOKEN environment variable".to_string())?;
 
         let mut lm_studio_url = env::var("LM_STUDIO_URL")
-            .unwrap_or_else(|_| "http://localhost:1234/v1".to_string());
+            .unwrap_or_else(|_| "http://localhost:1234".to_string());
         // Strip trailing slash if present
         if lm_studio_url.ends_with('/') {
             lm_studio_url.pop();
         }
+        // Normalize: if user specified /v1 at the end, strip it so base URL is http://host:port
+        if lm_studio_url.ends_with("/v1") {
+            lm_studio_url.truncate(lm_studio_url.len() - 3);
+        }
+
+        let api_token = env::var("LM_STUDIO_API_TOKEN")
+            .or_else(|_| env::var("LM_API_TOKEN"))
+            .ok()
+            .and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            });
+
+        let mcp_servers = match env::var("MCP_SERVERS") {
+            Ok(val) => {
+                let trimmed = val.trim();
+                if trimmed.eq_ignore_ascii_case("none") || trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    trimmed
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|s| {
+                            let s = s.trim().trim_matches('"').trim_matches('\'').to_string();
+                            if s.starts_with("mcp/") { s } else { format!("mcp/{}", s) }
+                        })
+                        .filter(|s| !s.is_empty() && s != "mcp/")
+                        .collect()
+                }
+            }
+            Err(_) => auto_detect_mcp_servers(),
+        };
 
         let default_model = env::var("LM_STUDIO_MODEL")
             .ok()
@@ -106,6 +165,8 @@ impl Config {
         Ok(Config {
             bot_token,
             lm_studio_url,
+            api_token,
+            mcp_servers,
             default_model,
             default_system_prompt,
             max_history_turns,

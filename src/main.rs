@@ -44,7 +44,18 @@ async fn main() -> anyhow::Result<()> {
         None => warn!("Access control disabled: bot is open to all Telegram users (AUTHORISED_USERS not set)"),
     }
 
-    let client = LmStudioClient::new(config.lm_studio_url.clone());
+    let client = LmStudioClient::new(
+        config.lm_studio_url.clone(),
+        config.api_token.clone(),
+        config.mcp_servers.clone(),
+    );
+
+    if !config.mcp_servers.is_empty() {
+        info!("MCP Integrations enabled: {:?}", config.mcp_servers);
+    } else {
+        info!("No MCP integrations active");
+    }
+
     let sessions = create_session_store();
 
     // Test connectivity to LM Studio

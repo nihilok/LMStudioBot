@@ -10,6 +10,7 @@ pub struct ChatSession {
     pub active_model: Option<String>,
     pub custom_system_prompt: Option<String>,
     pub custom_temperature: Option<f32>,
+    pub last_response_id: Option<String>,
     pub history: Vec<ChatMessage>,
 }
 
@@ -19,6 +20,7 @@ impl Default for ChatSession {
             active_model: None,
             custom_system_prompt: None,
             custom_temperature: None,
+            last_response_id: None,
             history: Vec::new(),
         }
     }
@@ -27,14 +29,17 @@ impl Default for ChatSession {
 impl ChatSession {
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.last_response_id = None;
     }
 
     pub fn set_model(&mut self, model: Option<String>) {
         self.active_model = model;
+        self.last_response_id = None;
     }
 
     pub fn set_system_prompt(&mut self, prompt: Option<String>) {
         self.custom_system_prompt = prompt;
+        self.last_response_id = None;
     }
 
     pub fn set_temperature(&mut self, temp: Option<f32>) {
@@ -57,30 +62,16 @@ impl ChatSession {
             .unwrap_or(fallback)
     }
 
-    /// Prepares the full message list for LM Studio, including system prompt and recent history
-    pub fn build_messages_for_prompt(&self, fallback_system: &str, user_text: &str) -> Vec<ChatMessage> {
-        let mut messages = Vec::new();
+    /// Records the user query, assistant response, and LM Studio response_id
+    pub fn record_exchange(
+        &mut self,
+        user_text: &str,
+        assistant_text: &str,
+        response_id: Option<String>,
+        max_turns: usize,
+    ) {
+        self.last_response_id = response_id;
 
-        let system_prompt = self.get_effective_system_prompt(fallback_system);
-        if !system_prompt.trim().is_empty() {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt.to_string(),
-            });
-        }
-
-        messages.extend(self.history.clone());
-
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: user_text.to_string(),
-        });
-
-        messages
-    }
-
-    /// Records the user query and assistant response, trimming history to max turns
-    pub fn record_exchange(&mut self, user_text: &str, assistant_text: &str, max_turns: usize) {
         self.history.push(ChatMessage {
             role: "user".to_string(),
             content: user_text.to_string(),
@@ -113,44 +104,29 @@ mod tests {
         let mut session = ChatSession::default();
         let max_turns = 2; // max 4 messages
 
-        session.record_exchange("u1", "a1", max_turns);
-        session.record_exchange("u2", "a2", max_turns);
+        session.record_exchange("u1", "a1", None, max_turns);
+        session.record_exchange("u2", "a2", None, max_turns);
         assert_eq!(session.history.len(), 4);
         assert_eq!(session.history[0].content, "u1");
 
         // Adding 3rd exchange should drop u1, a1
-        session.record_exchange("u3", "a3", max_turns);
+        session.record_exchange("u3", "a3", Some("resp_123".to_string()), max_turns);
         assert_eq!(session.history.len(), 4);
         assert_eq!(session.history[0].content, "u2");
         assert_eq!(session.history[1].content, "a2");
         assert_eq!(session.history[2].content, "u3");
         assert_eq!(session.history[3].content, "a3");
+        assert_eq!(session.last_response_id.as_deref(), Some("resp_123"));
     }
 
     #[test]
-    fn test_build_messages_for_prompt() {
+    fn test_clear_resets_response_id() {
         let mut session = ChatSession::default();
-        session.record_exchange("Hi", "Hello", 5);
+        session.record_exchange("u1", "a1", Some("resp_abc".to_string()), 5);
+        assert_eq!(session.last_response_id.as_deref(), Some("resp_abc"));
 
-        let msgs = session.build_messages_for_prompt("System prompt", "How are you?");
-        assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[0].content, "System prompt");
-        assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content, "Hi");
-        assert_eq!(msgs[2].role, "assistant");
-        assert_eq!(msgs[2].content, "Hello");
-        assert_eq!(msgs[3].role, "user");
-        assert_eq!(msgs[3].content, "How are you?");
-    }
-
-    #[test]
-    fn test_custom_system_prompt_override() {
-        let mut session = ChatSession::default();
-        session.set_system_prompt(Some("You are a pirate.".to_string()));
-
-        let msgs = session.build_messages_for_prompt("Default prompt", "Ahoy");
-        assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[0].content, "You are a pirate.");
+        session.clear_history();
+        assert!(session.last_response_id.is_none());
+        assert_eq!(session.history.len(), 0);
     }
 }

@@ -23,6 +23,8 @@ pub enum Command {
     System(String),
     #[command(description = "Set generation temperature (0.0 - 2.0): /temperature [value]")]
     Temperature(String),
+    #[command(description = "List active MCP server integrations.")]
+    Mcp,
     #[command(description = "Clear current conversation memory.")]
     Clear,
     #[command(description = "Clear current conversation memory (alias for /clear).")]
@@ -75,19 +77,26 @@ pub async fn handle_command(
 
     match cmd {
         Command::Start => {
+            let mcp_info = if client.mcp_servers().is_empty() {
+                "None active".to_string()
+            } else {
+                client.mcp_servers().join(", ")
+            };
+
             let welcome = format!(
                 "👋 *Welcome to LM Studio Telegram Bot!*\n\n\
                 I am connected to your local LM Studio instance at `{}`.\n\n\
+                *Active MCP Integrations:* `{}`\n\n\
                 *Quick Guide:*\n\
                 • Simply send me a text message to chat with your local LLM.\n\
                 • Use /models to see models currently loaded or available in LM Studio.\n\
                 • Use /model <name> to switch models for this chat.\n\
+                • Use /mcp to see active MCP tools and servers.\n\
                 • Use /clear or /reset to wipe the conversation history and start fresh.\n\
                 • Use /status to view current session settings.\n\
-                • Use /help to see all available commands.\n\n\
-                _Your conversation history is kept in memory up to {} turns._",
+                • Use /help to see all available commands.",
                 client.base_url(),
-                config.max_history_turns
+                mcp_info
             );
             send_safe_message(&bot, chat_id, &welcome).await?;
         }
@@ -211,6 +220,23 @@ pub async fn handle_command(
             }
         }
 
+        Command::Mcp => {
+            let servers = client.mcp_servers();
+            let text = if servers.is_empty() {
+                "ℹ️ *No MCP servers currently active.*\n\n\
+                To enable MCP tools, ensure they are configured in `~/.lmstudio/mcp.json` \
+                or set `MCP_SERVERS=mcp/<name>` in your `.env` file.".to_string()
+            } else {
+                let mut s = "🛠️ *Active MCP Servers Attached:*\n\n".to_string();
+                for srv in servers {
+                    s.push_str(&format!("• `{}`\n", srv));
+                }
+                s.push_str("\nThese MCP servers are attached to model queries and available for tool calling.");
+                s
+            };
+            send_safe_message(&bot, chat_id, &text).await?;
+        }
+
         Command::Clear | Command::Reset => {
             let mut store = sessions.write().await;
             let session = store.entry(chat_id).or_default();
@@ -244,20 +270,27 @@ pub async fn handle_command(
                 Err(_) => "🔴 Offline or Unreachable".to_string(),
             };
 
+            let mcp_info = if client.mcp_servers().is_empty() {
+                "None".to_string()
+            } else {
+                client.mcp_servers().join(", ")
+            };
+
             let status_msg = format!(
                 "📊 *Current Chat Status:*\n\n\
                 • *LM Studio URL:* `{}`\n\
                 • *Server Status:* {}\n\
                 • *Active Model:* `{}`\n\
                 • *Temperature:* `{:.2}`\n\
-                • *History Length:* `{}` message(s) (Max: {})\n\
+                • *MCP Servers:* `{}`\n\
+                • *History Length:* `{}` message(s)\n\
                 • *System Prompt:* {}\n",
                 client.base_url(),
                 lm_status,
                 model,
                 temp,
+                mcp_info,
                 history_len,
-                config.max_history_turns * 2,
                 if session.and_then(|s| s.custom_system_prompt.as_ref()).is_some() {
                     "Custom"
                 } else {
@@ -295,8 +328,8 @@ pub async fn handle_message(
 
     let chat_id = msg.chat.id;
 
-    // Resolve model to use
-    let (model, messages, temp) = {
+    // Resolve model, temperature, and previous_response_id
+    let (model, temp, system_prompt, prev_response_id) = {
         let store = sessions.read().await;
         let session = store.get(&chat_id);
 
@@ -308,15 +341,13 @@ pub async fn handle_message(
             .map(|s| s.get_effective_temperature(config.default_temperature))
             .unwrap_or(config.default_temperature);
 
-        let msgs = match session {
-            Some(s) => s.build_messages_for_prompt(&config.default_system_prompt, text),
-            None => {
-                let default_session = crate::session::ChatSession::default();
-                default_session.build_messages_for_prompt(&config.default_system_prompt, text)
-            }
-        };
+        let sys = session
+            .and_then(|s| s.custom_system_prompt.clone())
+            .unwrap_or_else(|| config.default_system_prompt.clone());
 
-        (selected_model, msgs, temp)
+        let prev_id = session.and_then(|s| s.last_response_id.clone());
+
+        (selected_model, temp, sys, prev_id)
     };
 
     let target_model = match model {
@@ -343,24 +374,38 @@ pub async fn handle_message(
     info!(
         chat_id = %chat_id,
         model = %target_model,
+        has_prev_id = prev_response_id.is_some(),
         "Sending prompt to LM Studio..."
     );
 
     // Start typing indicator loop
     let typing_task = spawn_typing_indicator(bot.clone(), chat_id);
 
-    let chat_result = client.chat_completion(&target_model, messages, temp).await;
+    let chat_result = client
+        .chat(
+            &target_model,
+            text,
+            Some(&system_prompt),
+            prev_response_id.as_deref(),
+            temp,
+        )
+        .await;
 
     // Stop typing indicator
     typing_task.abort();
 
     match chat_result {
-        Ok((reply_content, usage)) => {
+        Ok((reply_content, new_response_id, usage)) => {
             // Save turn in session history
             {
                 let mut store = sessions.write().await;
                 let session = store.entry(chat_id).or_default();
-                session.record_exchange(text, &reply_content, config.max_history_turns);
+                session.record_exchange(
+                    text,
+                    &reply_content,
+                    new_response_id,
+                    config.max_history_turns,
+                );
             }
 
             if let Some(u) = usage {
