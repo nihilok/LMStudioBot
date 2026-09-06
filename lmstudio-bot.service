@@ -1,0 +1,21 @@
+[Unit]
+Description=LM Studio Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Code/LMStudioBot
+ExecStart=%h/Code/LMStudioBot/target/release/lmstudio-telegram-bot
+Restart=always
+RestartSec=5s
+
+# Load environment variables
+EnvironmentFile=-%h/Code/LMStudioBot/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
