@@ -6,11 +6,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Code/LMStudioBot
+ExecStartPre=-%h/.lmstudio/bin/lms server start
 ExecStart=%h/Code/LMStudioBot/target/release/lmstudio-telegram-bot
+KillMode=process
 Restart=always
 RestartSec=5s
 
-# Load environment variables
+# Environment
+Environment="DISPLAY=:1"
+Environment="WAYLAND_DISPLAY=wayland-1"
 EnvironmentFile=-%h/Code/LMStudioBot/.env
 
 # Logging

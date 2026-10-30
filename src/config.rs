@@ -203,7 +203,7 @@ mod tests {
     fn test_parse_user_ids_multiple_in_array() {
         let parsed = parse_user_ids("[123456789, 987654321]").unwrap();
         assert!(parsed.contains(&123456789));
-        assert!(parsed.contains(&123456789));
+        assert!(parsed.contains(&987654321));
         assert_eq!(parsed.len(), 2);
     }
 
@@ -211,7 +211,7 @@ mod tests {
     fn test_parse_user_ids_comma_separated() {
         let parsed = parse_user_ids("123456789, 987654321").unwrap();
         assert!(parsed.contains(&123456789));
-        assert!(parsed.contains(&123456789));
+        assert!(parsed.contains(&987654321));
     }
 
     #[test]

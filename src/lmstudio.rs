@@ -77,6 +77,17 @@ struct NativeModelEntry {
     #[serde(default)]
     #[serde(rename = "type")]
     pub model_type: Option<String>,
+    #[serde(default)]
+    pub loaded_instances: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+impl NativeModelEntry {
+    pub fn is_loaded(&self) -> bool {
+        !self.loaded_instances.is_empty()
+            || self.state.as_deref() == Some("loaded")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -143,23 +154,33 @@ impl LmStudioClient {
         &self.mcp_servers
     }
 
-    /// Fetches all available LLM models from LM Studio
+    /// Fetches all available LLM models from LM Studio, prioritizing currently loaded models
     pub async fn fetch_models(&self) -> Result<Vec<String>, String> {
         // First try native /api/v1/models
         let native_endpoint = format!("{}/api/v1/models", self.base_url);
         if let Ok(resp) = self.client.get(&native_endpoint).send().await {
             if resp.status().is_success() {
                 if let Ok(list) = resp.json::<NativeModelListResponse>().await {
-                    let mut keys: Vec<String> = list
+                    let mut entries: Vec<NativeModelEntry> = list
                         .models
                         .into_iter()
                         .filter(|m| {
                             // Only include llm models, not embedding
                             m.model_type.as_deref().map_or(true, |t| t == "llm")
                         })
-                        .filter_map(|m| m.key.or(m.id))
                         .collect();
-                    keys.dedup();
+
+                    // Sort currently loaded models ahead of unloaded models on disk
+                    entries.sort_by_key(|m| !m.is_loaded());
+
+                    let mut keys = Vec::new();
+                    for m in entries {
+                        if let Some(k) = m.key.or(m.id) {
+                            if !keys.contains(&k) {
+                                keys.push(k);
+                            }
+                        }
+                    }
                     if !keys.is_empty() {
                         return Ok(keys);
                     }
@@ -306,18 +327,21 @@ impl LmStudioClient {
         let mut chat_result = self.execute_chat_request(&endpoint, &request_body).await;
 
         // Self-healing fallback: if continuation with previous_response_id failed
-        // (e.g. expired ID, server restart, template mismatch), retry as a fresh turn
-        if chat_result.is_err() && previous_response_id.is_some() {
-            tracing::warn!("Request with previous_response_id failed. Retrying with fresh conversation context...");
-            let fallback_body = NativeChatRequest {
-                model: model.to_string(),
-                input: input.to_string(),
-                system_prompt: system_prompt.map(|s| s.to_string()),
-                previous_response_id: None,
-                temperature: Some(temperature),
-                integrations: request_body.integrations.clone(),
-            };
-            chat_result = self.execute_chat_request(&endpoint, &fallback_body).await;
+        // (e.g. expired ID, server restart, template mismatch), retry as a fresh turn.
+        // Do NOT retry if the request timed out, as that would double the stall.
+        if let Err(ref err) = chat_result {
+            if previous_response_id.is_some() && !err.contains("timed out") {
+                tracing::warn!(error = %err, "Request with previous_response_id failed. Retrying with fresh conversation context...");
+                let fallback_body = NativeChatRequest {
+                    model: model.to_string(),
+                    input: input.to_string(),
+                    system_prompt: system_prompt.map(|s| s.to_string()),
+                    previous_response_id: None,
+                    temperature: Some(temperature),
+                    integrations: request_body.integrations.clone(),
+                };
+                chat_result = self.execute_chat_request(&endpoint, &fallback_body).await;
+            }
         }
 
         let chat_resp = chat_result?;
